@@ -25,7 +25,7 @@ Abra o seu Prompt de Comando (CMD) ou PowerShell e siga os passos abaixo:
 
 **1. Clone este repositório para o seu computador:**
 ```bash
-git clone [https://github.com/SEU_USUARIO/NOME_DO_SEU_REPOSITORIO.git](https://github.com/SEU_USUARIO/NOME_DO_SEU_REPOSITORIO.git)
+git clone [https://github.com/kauebbs/StickerWPPmaker.git](https://github.com/kauebbs/StickerWPPmaker.git)
 ```
 *(Não esqueça de trocar o link acima pelo link real do seu repositório no GitHub)*
 
