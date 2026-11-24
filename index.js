@@ -26,6 +26,8 @@ function findChrome() {
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
         '/usr/bin/google-chrome',
         '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
     ];
     return candidates.find((p) => p && fs.existsSync(p)) || null;
 }
@@ -35,6 +37,24 @@ let chromePath = findChrome();
 // Sessão e cache ficam FORA da pasta do projeto (que está no OneDrive):
 // o OneDrive sincronizando os arquivos do navegador deixa o WhatsApp Web lentíssimo.
 fs.mkdirSync(config.dataDir, { recursive: true });
+
+// Opções extras do navegador para servidores pequenos (ex.: Google Cloud e2-micro, 1 GB)
+function browserArgs() {
+    const args = [];
+    if (process.platform === 'linux') {
+        args.push('--disable-dev-shm-usage', '--disable-gpu');
+        // O Chrome não abre como root sem isto (em servidor, prefira um usuário comum)
+        if (typeof process.getuid === 'function' && process.getuid() === 0) args.push('--no-sandbox');
+    }
+    if (config.lowMemory) {
+        args.push(
+            '--no-first-run', '--no-default-browser-check', '--disable-extensions',
+            '--disable-background-networking', '--disable-component-update',
+            '--disable-sync', '--mute-audio', '--renderer-process-limit=2',
+        );
+    }
+    return args;
+}
 
 // Qual versão do WhatsApp Web carregar (ver waWebVersions em src/config.js)
 function applyWebVersion(version) {
@@ -53,6 +73,7 @@ const client = new Client({
     authTimeoutMs: config.loadTimeoutMs,
     puppeteer: {
         headless: config.headless,
+        args: browserArgs(),
         ...(chromePath ? { executablePath: chromePath } : {}),
     },
 });

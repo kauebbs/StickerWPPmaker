@@ -4,7 +4,9 @@
   "description": "Bot de WhatsApp que cria figurinhas (fotos, vídeos, GIFs e texto animado) e GIFs",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "servidor:qr": "MAX_CONCURRENT=1 LOW_MEMORY=true node index.js",
+    "servidor:iniciar": "pm2 start ecosystem.config.js && pm2 save"
   },
   "engines": {
     "node": ">=20.9.0"

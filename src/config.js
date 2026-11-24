@@ -32,8 +32,11 @@ module.exports = {
         width: Number(process.env.GIF_WIDTH || 480),
     },
 
-    // Quantas mídias processar ao mesmo tempo
+    // Quantas mídias processar ao mesmo tempo (use 1 em servidores pequenos)
     maxConcurrent: Number(process.env.MAX_CONCURRENT || 2),
+
+    // LOW_MEMORY=true deixa o navegador mais econômico (para servidores com 1 GB de RAM)
+    lowMemory: (process.env.LOW_MEMORY || 'false').toLowerCase() === 'true',
 
     // Caminho do Google Chrome (necessário para ENVIAR vídeos/GIFs pelo whatsapp-web.js).
     // Se vazio, o bot tenta achar o Chrome automaticamente.

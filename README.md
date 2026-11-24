@@ -15,6 +15,7 @@ O bot **começa desligado**: só você, dono do número, liga e desliga, em um c
 - [Funcionalidades](#funcionalidades)
 - [Requisitos](#requisitos)
 - [Instalação](#instalação)
+- [Hospedagem gratuita 24h](#hospedagem-gratuita-24h)
 - [Primeiro uso](#primeiro-uso)
 - [Ligar e desligar o bot](#ligar-e-desligar-o-bot)
 - [Comandos](#comandos)
@@ -88,6 +89,12 @@ npm start
 A sessão fica salva. Nas próximas vezes, é só rodar `npm start`, sem precisar de QR Code.
 
 Para **parar o bot**, aperte `Ctrl + C` no terminal.
+
+---
+
+## Hospedagem gratuita 24h
+
+Quer o bot ligado sem deixar o PC ligado? Veja o guia **[HOSPEDAGEM.md](HOSPEDAGEM.md)**: passo a passo para rodar de graça numa máquina **e2-micro do Google Cloud**, com script de instalação automática e `pm2` para manter o bot sempre no ar.
 
 ---
 
@@ -204,6 +211,7 @@ $env:STICKER_AUTHOR="MeuNome"; $env:STICKER_NAME="MeuPack"; npm start
 | `GIF_MAX_DURATION` | `15` | Duração máxima do `!gif` (s) |
 | `GIF_WIDTH` | `480` | Largura dos GIFs gerados (px) |
 | `MAX_CONCURRENT` | `2` | Quantas mídias processar ao mesmo tempo |
+| `LOW_MEMORY` | `false` | `true` deixa o navegador mais econômico (servidores com 1 GB) |
 | `WA_WEB_VERSION` | versões fixadas | Versão do WhatsApp Web (separe várias por vírgula), ou `latest` |
 | `LOAD_TIMEOUT_MS` | `60000` | Quanto esperar o WhatsApp Web carregar antes de tentar de novo (ms) |
 | `HEADLESS` | `true` | `false` mostra a janela do navegador (para investigar problemas) |
@@ -271,6 +279,9 @@ Confira se o Node é 20 ou mais novo com `node -v`. Se for mais antigo, atualize
 
 ```
 index.js            Conexão com o WhatsApp, comandos e fila de processamento
+ecosystem.config.js Configuração do pm2 para rodar em servidor
+deploy/
+└── setup-servidor.sh  Instala tudo num servidor Linux (ver HOSPEDAGEM.md)
 src/
 ├── config.js       Configurações (todas podem vir de variáveis de ambiente)
 ├── converter.js    Conversões de imagem, vídeo e texto (sharp + FFmpeg)
