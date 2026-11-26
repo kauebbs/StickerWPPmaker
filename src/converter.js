@@ -60,6 +60,12 @@ function extFromMime(mimetype = '') {
     if (mimetype.includes('quicktime')) return '.mov';
     if (mimetype.includes('webp')) return '.webp';
     if (mimetype.includes('3gpp')) return '.3gp';
+    if (mimetype.includes('ogg')) return '.ogg';
+    if (mimetype.includes('mpeg') || mimetype.includes('mp3')) return '.mp3';
+    if (mimetype.includes('aac')) return '.aac';
+    if (mimetype.includes('wav')) return '.wav';
+    if (mimetype.includes('audio/mp4') || mimetype.includes('m4a')) return '.m4a';
+    if (mimetype.includes('opus')) return '.opus';
     return '.mp4';
 }
 
@@ -238,7 +244,8 @@ async function encodeStaticWebp(pngBuffer) {
     return out;
 }
 
-async function imageToSticker(buffer, { mode = 'esticar', caption = '', color } = {}) {
+// Imagem 512x512 com transparência (modo, recorte redondo e legenda aplicados)
+async function renderStaticPng(buffer, { mode = 'esticar', caption = '', color } = {}) {
     const fit = MODES[mode] || 'fill';
     let png = await sharp(buffer, { animated: false })
         .rotate() // respeita a orientação da foto do celular
@@ -247,13 +254,15 @@ async function imageToSticker(buffer, { mode = 'esticar', caption = '', color } 
         .png()
         .toBuffer();
 
-    const layers = [];
-    if (mode === 'redondo') layers.push({ input: circleMaskSvg(), blend: 'dest-in' });
-    if (layers.length) png = await sharp(png).composite(layers).png().toBuffer();
+    if (mode === 'redondo') png = await sharp(png).composite([{ input: circleMaskSvg(), blend: 'dest-in' }]).png().toBuffer();
     if (caption) {
         png = await sharp(png).composite([{ input: await captionOverlay(caption, { color }) }]).png().toBuffer();
     }
-    return encodeStaticWebp(png);
+    return png;
+}
+
+async function imageToSticker(buffer, opts = {}) {
+    return encodeStaticWebp(await renderStaticPng(buffer, opts));
 }
 
 // ---------------------------------------------------------------------------
@@ -285,62 +294,90 @@ const ANIM_ATTEMPTS = [
     { fps: 8, q: 18, durFactor: 0.5 },
 ];
 
+// Para figurinha com som: a animação NUNCA fica mais curta que o som. Em vez de cortar
+// a duração, diminui qualidade, quadros por segundo e o tamanho da imagem (o WhatsApp
+// aceita figurinha menor que 512 px e amplia na tela).
+const SOUND_ANIM_ATTEMPTS = [
+    { fps: 15, q: 75 },
+    { fps: 15, q: 55 },
+    { fps: 12, q: 45 },
+    { fps: 10, q: 35 },
+    { fps: 10, q: 30, side: 448 },
+    { fps: 8, q: 30, side: 384 },
+    { fps: 8, q: 25, side: 320 },
+    { fps: 6, q: 20, side: 256 },
+    { fps: 5, q: 15, side: 192 },
+];
+
 async function encodeAnimatedWebp(framePaths, sourceFps, attempts = ANIM_ATTEMPTS) {
     const maxBytes = config.animated.maxKB * 1024;
     const frames = await Promise.all(framePaths.map((f) => fs.readFile(f)));
+    const totalMs = Math.round((frames.length * 1000) / sourceFps);
     let out;
     for (const att of attempts) {
         const fps = Math.min(att.fps, sourceFps);
         const keepCount = Math.max(1, Math.round(frames.length * (att.durFactor || 1)));
-        const picked = [];
+        let picked = [];
         for (let i = 0; ; i++) {
             const idx = Math.round((i * sourceFps) / fps);
             if (idx >= keepCount) break;
             picked.push(frames[idx]);
         }
-        const delay = Math.round(1000 / fps);
+        if (att.side && att.side < SIZE) {
+            picked = await Promise.all(picked.map((f) => sharp(f).resize(att.side, att.side).png({ compressionLevel: 1 }).toBuffer()));
+        }
+        // Tempo de cada quadro somando exatamente a duração original (sem ganhar nem perder ms)
+        const keptMs = Math.round(totalMs * (keepCount / frames.length));
+        const delay = picked.map((_, k) => Math.round(((k + 1) * keptMs) / picked.length) - Math.round((k * keptMs) / picked.length));
         out = await sharp(picked, { join: { animated: true } })
-            .webp({ quality: att.q, effort: 4, loop: 0, delay: picked.map(() => delay) })
+            .webp({ quality: att.q, effort: 4, loop: 0, delay })
             .toBuffer();
         if (out.length <= maxBytes) break;
     }
     return out;
 }
 
-async function videoToSticker(buffer, mimetype, { mode = 'esticar', caption = '', color, start = 0, duration } = {}) {
+// Duração total (s) e lado (px) de uma figurinha animada
+async function animatedInfo(webp) {
+    const m = await sharp(webp, { animated: true }).metadata();
+    const ms = (m.delay || []).reduce((a, b) => a + b, 0);
+    return { seconds: ms / 1000, side: m.width, frames: m.pages || 1 };
+}
+
+// Monta os filtros do FFmpeg para a entrada de vídeo [0:v]: FPS, modo (esticar/cortar/...),
+// recorte redondo e legenda. Devolve as entradas extras e o nome da saída do filtro.
+async function stickerFilterGraph(dir, { mode, caption, color, fps, firstInput = 1 }) {
+    const extraInputs = [];
+    let n = firstInput;
+    let graph = `[0:v]fps=${fps},format=rgba,${modeFilter(mode)},setsar=1[v0]`;
+    let cur = 'v0';
+
+    if (mode === 'redondo') {
+        const maskFile = path.join(dir, 'mask.png');
+        await sharp(circleMaskSvg(true)).greyscale().png().toFile(maskFile);
+        extraInputs.push('-loop', '1', '-i', maskFile);
+        graph += `;[${n}:v]format=gray,scale=${SIZE}:${SIZE}[m];[${cur}][m]alphamerge[v1]`;
+        cur = 'v1';
+        n++;
+    }
+    if (caption) {
+        const capFile = path.join(dir, 'caption.png');
+        await fs.writeFile(capFile, await captionOverlay(caption, { color }));
+        extraInputs.push('-loop', '1', '-i', capFile);
+        graph += `;[${cur}][${n}:v]overlay=0:0:shortest=1:format=auto[v2]`;
+        cur = 'v2';
+        n++;
+    }
+    return { extraInputs, graph, out: cur, nextInput: n };
+}
+
+async function videoToSticker(buffer, mimetype, { mode = 'esticar', caption = '', color, start = 0, duration, keepDuration = false } = {}) {
     const dur = Math.min(duration || config.animated.defaultDuration, config.animated.maxDuration);
     const FPS = 15;
 
     return withTempDir(async (dir) => {
         const input = await inputArgs(dir, buffer, mimetype, start);
-        const extraInputs = [];
-        let maskIdx = -1;
-        let captionIdx = -1;
-        let n = 1;
-
-        if (mode === 'redondo') {
-            const maskFile = path.join(dir, 'mask.png');
-            await sharp(circleMaskSvg(true)).greyscale().png().toFile(maskFile);
-            maskIdx = n++;
-            extraInputs.push('-loop', '1', '-i', maskFile);
-        }
-        if (caption) {
-            const capFile = path.join(dir, 'caption.png');
-            await fs.writeFile(capFile, await captionOverlay(caption, { color }));
-            captionIdx = n++;
-            extraInputs.push('-loop', '1', '-i', capFile);
-        }
-
-        let graph = `[0:v]fps=${FPS},format=rgba,${modeFilter(mode)},setsar=1[v0]`;
-        let cur = 'v0';
-        if (maskIdx > 0) {
-            graph += `;[${maskIdx}:v]format=gray,scale=${SIZE}:${SIZE}[m];[${cur}][m]alphamerge[v1]`;
-            cur = 'v1';
-        }
-        if (captionIdx > 0) {
-            graph += `;[${cur}][${captionIdx}:v]overlay=0:0:shortest=1:format=auto[v2]`;
-            cur = 'v2';
-        }
+        const { extraInputs, graph, out } = await stickerFilterGraph(dir, { mode, caption, color, fps: FPS });
 
         const framesDir = path.join(dir, 'frames');
         await fs.mkdir(framesDir);
@@ -348,7 +385,7 @@ async function videoToSticker(buffer, mimetype, { mode = 'esticar', caption = ''
             ...input.pre,
             ...extraInputs,
             '-filter_complex', graph,
-            '-map', `[${cur}]`,
+            '-map', `[${out}]`,
             ...input.post,
             '-t', String(dur),
             '-an',
@@ -358,8 +395,70 @@ async function videoToSticker(buffer, mimetype, { mode = 'esticar', caption = ''
 
         const files = (await fs.readdir(framesDir)).filter((f) => f.endsWith('.png')).sort();
         if (!files.length) throw new Error('Nenhum quadro extraído (o início escolhido passa do fim do vídeo?)');
-        return encodeAnimatedWebp(files.map((f) => path.join(framesDir, f)), FPS);
+        return encodeAnimatedWebp(files.map((f) => path.join(framesDir, f)), FPS, keepDuration ? SOUND_ANIM_ATTEMPTS : ANIM_ATTEMPTS);
     });
+}
+
+// Um quadro do vídeo (no segundo "start") -> figurinha parada
+async function videoFrameToSticker(buffer, mimetype, { mode, caption, color, start = 0 } = {}) {
+    return withTempDir(async (dir) => {
+        const input = await inputArgs(dir, buffer, mimetype, start);
+        const frame = path.join(dir, 'quadro.png');
+        await runFfmpeg([...input.pre, ...input.post, '-frames:v', '1', frame]);
+        return imageToSticker(await fs.readFile(frame), { mode, caption, color });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Trecho mais alto do áudio (ideia do StikSound: efeitos sonoros costumam ter
+// silêncio antes/depois; a janela com mais energia é um começo melhor)
+// ---------------------------------------------------------------------------
+
+const PCM_RATE = 8000;
+
+async function decodePcm(buffer, mimetype, maxSeconds = 180) {
+    return withTempDir(async (dir) => {
+        const file = path.join(dir, `audio${extFromMime(mimetype)}`);
+        await fs.writeFile(file, buffer);
+        const raw = path.join(dir, 'audio.f32');
+        try {
+            await runFfmpeg(['-i', file, '-t', String(maxSeconds), '-map', '0:a:0', '-ac', '1', '-ar', String(PCM_RATE), '-f', 'f32le', raw]);
+        } catch (err) {
+            if (/matches no streams|does not contain any stream/i.test(err.message)) throw new NoAudioError('sem áudio');
+            throw err;
+        }
+        const data = await fs.readFile(raw);
+        return new Float32Array(data.buffer, data.byteOffset, Math.floor(data.length / 4));
+    });
+}
+
+// Segundo em que começa a janela de "windowSec" com mais energia
+function loudestWindowStart(samples, windowSec, rate = PCM_RATE) {
+    const total = samples.length / rate;
+    if (total <= windowSec) return 0;
+    const block = Math.max(1, Math.round(rate * 0.02)); // blocos de 20 ms
+    const blocks = Math.floor(samples.length / block);
+    const energy = new Float64Array(blocks);
+    for (let b = 0; b < blocks; b++) {
+        let sum = 0;
+        for (let i = b * block, end = i + block; i < end; i++) sum += samples[i] * samples[i];
+        energy[b] = sum;
+    }
+    const win = Math.min(blocks, Math.round(windowSec / 0.02));
+    let cur = 0;
+    for (let b = 0; b < win; b++) cur += energy[b];
+    let best = cur;
+    let bestStart = 0;
+    for (let start = 1; start + win <= blocks; start++) {
+        cur += energy[start + win - 1] - energy[start - 1];
+        if (cur > best * 1.0001) { best = cur; bestStart = start; }
+    }
+    return Math.min(bestStart * 0.02, total - windowSec);
+}
+
+async function findLoudestStart(buffer, mimetype, windowSec) {
+    const samples = await decodePcm(buffer, mimetype);
+    return +loudestWindowStart(samples, windowSec).toFixed(2);
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +587,57 @@ async function toGifFile(buffer, mimetype, { start = 0, duration } = {}) {
     });
 }
 
+// Áudio de um vídeo ou de um áudio -> mensagem de voz (OGG/Opus, como o WhatsApp grava)
+class NoAudioError extends Error {}
+
+async function extractVoiceNote(buffer, mimetype, { start = 0, duration, maxDuration } = {}) {
+    const cap = maxDuration || config.sound.maxDuration;
+    const dur = Math.min(duration || cap, cap);
+    return withTempDir(async (dir) => {
+        const file = path.join(dir, `input${extFromMime(mimetype)}`);
+        await fs.writeFile(file, buffer);
+        const wav = path.join(dir, 'audio.wav');
+        const output = path.join(dir, 'audio.ogg');
+        try {
+            // Etapa 1: PCM mono 48 kHz começando exatamente no zero.
+            // Vídeos de celular costumam ter o áudio começando um pouco depois do vídeo
+            // (atraso do AAC, listas de edição do iPhone). O aresample preenche esse começo
+            // com silêncio (mantém a sincronia) e o Ogg final não fica com "buraco" no início,
+            // que faz o WhatsApp mostrar "Couldn't play sticker sound".
+            await runFfmpeg([
+                ...(start > 0 ? ['-ss', String(start)] : []),
+                '-i', file,
+                '-map', '0:a:0', '-vn', '-sn', '-dn', '-map_metadata', '-1',
+                '-af', 'aresample=48000:async=1:first_pts=0,asetpts=PTS-STARTPTS',
+                '-ac', '1', '-ar', '48000',
+                '-t', String(dur),
+                '-c:a', 'pcm_s16le',
+                wav,
+            ]);
+        } catch (err) {
+            if (/matches no streams|does not contain any stream|Output file is empty/i.test(err.message)) {
+                throw new NoAudioError('sem áudio');
+            }
+            throw err;
+        }
+        const pcmBytes = (await fs.stat(wav)).size - 44;
+        if (pcmBytes < 48000 * 2 * 0.1) throw new NoAudioError('sem áudio'); // menos de 0,1 s
+
+        // Etapa 2: Opus mono, como a mensagem de voz do WhatsApp, com fade de 15 ms nas
+        // pontas (corte no meio da onda vira um "clique")
+        await runFfmpeg([
+            '-i', wav,
+            '-af', 'afade=t=in:d=0.015,areverse,afade=t=in:d=0.015,areverse',
+            '-c:a', 'libopus', '-b:a', '32k', '-vbr', 'on', '-application', 'voip', '-frame_duration', '20',
+            '-ac', '1', '-ar', '48000', '-map_metadata', '-1',
+            output,
+        ]);
+        const out = await fs.readFile(output);
+        if (out.length < 200) throw new NoAudioError('sem áudio');
+        return out;
+    });
+}
+
 // Figurinha -> imagem PNG (primeiro quadro)
 async function stickerToImage(buffer) {
     return sharp(buffer, { animated: false }).png().toBuffer();
@@ -506,4 +656,10 @@ module.exports = {
     toGifVideo,
     toGifFile,
     stickerToImage,
+    extractVoiceNote,
+    videoFrameToSticker,
+    animatedInfo,
+    findLoudestStart,
+    loudestWindowStart,
+    NoAudioError,
 };

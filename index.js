@@ -6,6 +6,8 @@ const config = require('./src/config');
 const conv = require('./src/converter');
 const { parseOptions, parseCommand, normalize } = require('./src/parse');
 const access = require('./src/access');
+const { downloadMyInstants, findMyInstantsUrl, MyInstantsError } = require('./src/myinstants');
+const { sendSoundSticker: sendRealSoundSticker, SoundStickerError, oggOpusSeconds } = require('./src/soundsticker');
 
 const P = config.prefix;
 
@@ -115,7 +117,27 @@ async function getMedia(message) {
     return { media, buffer: Buffer.from(media.data, 'base64'), mimetype: media.mimetype || '' };
 }
 
+// Baixa a mídia da própria mensagem E a da mensagem respondida (para combinar foto + áudio)
+async function getAllMedia(message) {
+    const sources = [];
+    if (message.hasMedia) sources.push(message);
+    if (message.hasQuotedMsg) {
+        const quoted = await message.getQuotedMessage();
+        if (quoted && quoted.hasMedia) sources.push(quoted);
+    }
+    const out = [];
+    for (const src of sources) {
+        const media = await src.downloadMedia();
+        if (!media || !media.data) throw new UserError('Não consegui baixar essa mídia. Tente enviar de novo.');
+        const input = { media, buffer: Buffer.from(media.data, 'base64'), mimetype: media.mimetype || '' };
+        input.kind = await mediaKind(input);
+        out.push(input);
+    }
+    return out;
+}
+
 async function mediaKind({ mimetype, buffer }) {
+    if (mimetype.startsWith('audio')) return 'audio';
     if (mimetype.includes('webp')) return (await conv.isAnimatedWebp(buffer)) ? 'animated-sticker' : 'sticker';
     if (mimetype.includes('gif') || mimetype.startsWith('video')) return 'video';
     if (mimetype.startsWith('image')) return 'image';
@@ -138,7 +160,7 @@ async function reply(message, content, options = {}) {
 
 async function sendSticker(message, webp, { name, author } = {}) {
     const media = new MessageMedia('image/webp', webp.toString('base64'), 'figurinha.webp');
-    await reply(message, media, {
+    return reply(message, media, {
         sendMediaAsSticker: true,
         stickerName: name ?? config.stickerName,
         stickerAuthor: author ?? config.stickerAuthor,
@@ -159,6 +181,16 @@ const MENU = `🤖 *kuebot — comandos*
    • cor da legenda: _amarelo_, _vermelho_, _azul_...
    • o resto vira *legenda*
    Ex.: ${P}fig redondo 2-6 bom dia grupo
+
+🔊 *${P}figsom* — figurinha com som 🔊
+   Responda a um vídeo (usa o som dele), mande uma
+   foto/vídeo com a legenda respondendo a um áudio, ou
+   cole um link do MyInstants.
+   Animada: até 5s de som · parada: até 10s
+   Aceita as opções do ${P}fig. Ex.: ${P}figsom 3-8
+   _${P}figsom parada_ — vídeo vira figurinha parada (até 10s)
+   _${P}figsom longo_ — 🧪 até 10s animada / 20s parada (pode não tocar)
+   _${P}figsom separado_ — figurinha e som em mensagens separadas
 
 🔤 *${P}texto* frase — figurinha só de texto
    Ex.: ${P}texto amarelo sextou!
@@ -251,22 +283,157 @@ ownerCommand(['status', 'onde'], async (message) => {
     await reply(message, `📋 *Status do bot*\nNeste chat: ${here}\n\n${lines.length ? lines.join('\n') : 'Desligado em todos os chats.'}`);
 });
 
+// Monta a figurinha (estática ou animada) de acordo com o tipo da mídia
+async function makeSticker(input, kind, opts) {
+    const common = { mode: opts.mode, caption: opts.text, color: opts.color };
+    if (kind === 'image' || kind === 'sticker') return conv.imageToSticker(input.buffer, common);
+    if (kind === 'video' || kind === 'animated-sticker') {
+        return conv.videoToSticker(input.buffer, input.mimetype, {
+            ...common, start: opts.start, duration: opts.duration, keepDuration: !!opts.keepDuration,
+        });
+    }
+    throw new UserError('Formato não suportado. Mande foto, vídeo curto ou GIF!');
+}
+
 command(['fig', 'figurinha', 's', 'sticker', 'f'], async (message, raw) => {
     const input = await getMedia(message);
     if (!input) throw new UserError(`Envie uma foto/vídeo/GIF com a legenda *${P}fig* ou responda a uma mídia com *${P}fig*.`);
     const opts = parseOptions(raw, { modes: true, time: true });
-    const kind = await mediaKind(input);
-    const common = { mode: opts.mode, caption: opts.text, color: opts.color };
+    await sendSticker(message, await makeSticker(input, await mediaKind(input), opts));
+});
 
-    let webp;
-    if (kind === 'image' || kind === 'sticker') {
-        webp = await conv.imageToSticker(input.buffer, common);
-    } else if (kind === 'video' || kind === 'animated-sticker') {
-        webp = await conv.videoToSticker(input.buffer, input.mimetype, { ...common, start: opts.start, duration: opts.duration });
-    } else {
-        throw new UserError('Formato não suportado. Mande foto, vídeo curto ou GIF!');
+// Figurinha com som.
+// O WhatsApp liberou figurinhas com som no Brasil em 24/11/2026. O bot envia a figurinha com
+// som DE VERDADE pelos módulos internos do WhatsApp Web (ver src/soundsticker.js, baseado na
+// extensão https://github.com/KaraBala10/whatsapp-audio-stickers). Se o WhatsApp Web recusar,
+// manda a figurinha e o som separados (mensagem de voz respondendo à figurinha).
+async function sendStickerPlusVoice(message, webp, voiceNote) {
+    const sticker = await sendSticker(message, webp);
+    const audio = new MessageMedia('audio/ogg; codecs=opus', voiceNote.toString('base64'), 'som.ogg');
+    await client.sendMessage(chatOf(message), audio, {
+        sendAudioAsVoice: true,
+        ...(sticker && sticker.id ? { quotedMessageId: sticker.id._serialized } : {}),
+    });
+}
+
+const SOUND_HELP = `🔊 *Figurinha com som*\n`
+    + `• Responda a um *vídeo* com *${P}figsom* (usa o som do vídeo)\n`
+    + `• Mande uma *foto/vídeo* com a legenda *${P}figsom* respondendo a um *áudio*\n`
+    + `• Ou cole um link do *MyInstants*: *${P}figsom https://www.myinstants.com/...*\n`
+    + `Animada: até ${config.sound.animatedMaxDuration}s de som · parada: até ${config.sound.maxDuration}s\n`
+    + `🧪 *longo*: até ${config.sound.longAnimatedMaxDuration}s animada · ${config.sound.longMaxDuration}s parada (experimental)`;
+
+command(['figsom', 'figaudio', 'somfig', 'fs', 'som'], async (message, rawText) => {
+    // Link do MyInstants pode vir em qualquer lugar do texto
+    const { url: instantsUrl, rest: raw } = findMyInstantsUrl(rawText);
+    const opts = parseOptions(raw, {
+        modes: true, time: true,
+        flags: {
+            separado: 'separate', separados: 'separate', parada: 'still', parado: 'still', estatica: 'still',
+            longo: 'long', longa: 'long', estendido: 'long', estendida: 'long',
+        },
+    });
+
+    const inputs = await getAllMedia(message);
+    const visual = inputs.find((i) => ['image', 'video', 'sticker', 'animated-sticker'].includes(i.kind));
+    if (!visual) throw new UserError(SOUND_HELP);
+
+    // De onde vem o som: link do MyInstants > áudio enviado/respondido > o próprio vídeo
+    let audio = inputs.find((i) => i.kind === 'audio') || null;
+    if (instantsUrl) {
+        try {
+            const dl = await downloadMyInstants(instantsUrl);
+            audio = { buffer: dl.buffer, mimetype: dl.mimetype, kind: 'audio' };
+            if (dl.title) console.log(`Som do MyInstants: ${dl.title}`);
+        } catch (err) {
+            if (err instanceof MyInstantsError) throw new UserError(`Não consegui baixar o som do MyInstants: ${err.message}`);
+            throw err;
+        }
     }
-    await sendSticker(message, webp);
+    const isVideo = visual.kind === 'video';
+    const sameFile = !audio;
+    if (sameFile && !isVideo) {
+        throw new UserError(`Essa mídia não tem som. Responda a um áudio ou cole um link do MyInstants.\n\n${SOUND_HELP}`);
+    }
+    const audioSource = audio || visual;
+
+    // Regras do WhatsApp: figurinha animada com até 5s de som; parada com até 10s.
+    // Com a opção "parada", um vídeo vira figurinha parada (primeiro quadro) e aceita até 10s.
+    let kind = visual.kind;
+    if (opts.still && kind === 'video') kind = 'image-from-video';
+    const animated = kind === 'video' || kind === 'animated-sticker';
+    // "longo" (experimental): passa dos limites do WhatsApp; sem trecho, usa o máximo
+    const long = !!opts.long;
+    const normalMax = animated ? config.sound.animatedMaxDuration : config.sound.maxDuration;
+    const maxDuration = long
+        ? (animated ? config.sound.longAnimatedMaxDuration : config.sound.longMaxDuration)
+        : normalMax;
+    const wanted = opts.duration || (long || !sameFile ? maxDuration : config.sound.videoDuration);
+    const duration = Math.min(wanted, maxDuration);
+
+    //  • som do próprio vídeo: o trecho vale para os dois
+    //  • som separado: o trecho escolhe o pedaço do som; sem trecho, o bot pega o mais alto
+    let audioStart = opts.start || 0;
+    if (!sameFile && opts.start === undefined) {
+        try {
+            audioStart = await conv.findLoudestStart(audioSource.buffer, audioSource.mimetype, duration);
+        } catch (err) {
+            if (!(err instanceof conv.NoAudioError)) throw err;
+        }
+    }
+    const videoStart = sameFile ? audioStart : 0;
+
+    let voiceNote;
+    let webp;
+    let side = 512;
+    try {
+        voiceNote = await conv.extractVoiceNote(audioSource.buffer, audioSource.mimetype, { start: audioStart, duration, maxDuration });
+        if (kind === 'image-from-video') {
+            webp = await conv.videoFrameToSticker(visual.buffer, visual.mimetype, { ...opts, start: videoStart });
+        } else {
+            webp = await makeSticker(visual, kind, { ...opts, start: videoStart, duration, keepDuration: true });
+        }
+        // O som não pode ser mais longo que a animação (vídeo mais curto que o trecho, por ex.)
+        if (animated) {
+            const info = await conv.animatedInfo(webp);
+            side = info.side;
+            const soundSeconds = oggOpusSeconds(voiceNote);
+            if (info.seconds > 0.2 && soundSeconds > info.seconds + 0.05) {
+                voiceNote = await conv.extractVoiceNote(audioSource.buffer, audioSource.mimetype, { start: audioStart, duration: info.seconds, maxDuration });
+            }
+        }
+    } catch (err) {
+        if (err instanceof conv.NoAudioError) {
+            throw new UserError(`Esse ${sameFile ? 'vídeo' : 'áudio'} não tem som 🔇 (GIFs do WhatsApp nunca têm).\n\n${SOUND_HELP}`);
+        }
+        throw err;
+    }
+
+    if (!opts.separate) {
+        try {
+            const sent = await sendRealSoundSticker(client, chatOf(message), webp, voiceNote, {
+                isAnimated: animated, side, name: config.stickerName, author: config.stickerAuthor,
+            });
+            console.log(`Figurinha com som enviada${sent && sent.hasAudio ? '' : ' (sem confirmação do áudio)'}`);
+            const seconds = Math.round(oggOpusSeconds(voiceNote) * 10) / 10;
+            if (long && seconds > normalMax) {
+                await reply(message, `🧪 Figurinha longa (${seconds}s de som) é *experimental*: o WhatsApp foi feito para até ${normalMax}s `
+                    + `em figurinha ${animated ? 'animada' : 'parada'}. Se aparecer "Couldn't play sticker sound", mande sem o *longo*.`);
+            } else if (wanted > maxDuration) {
+                await reply(message, `✂️ Usei ${maxDuration}s de som (máximo ${long ? 'do modo longo' : 'do WhatsApp'} para figurinha ${animated ? 'animada' : 'parada'}).`
+                    + (!long ? ` Use *${P}figsom longo* para tentar mais (experimental).` : ''));
+            }
+            return;
+        } catch (err) {
+            if (!(err instanceof SoundStickerError)) throw err;
+            console.warn('Figurinha com som falhou, mandando separado:', err.message);
+            const why = err.message.startsWith('SEM_SUPORTE')
+                ? 'esta versão do WhatsApp Web ainda não tem figurinha com som. Reinicie o bot: com a sessão salva ele abre a versão mais nova'
+                : err.message.slice(0, 120);
+            await reply(message, `⚠️ Não deu para mandar como figurinha com som (${why}). Mandei a figurinha e o som separados.`);
+        }
+    }
+    await sendStickerPlusVoice(message, webp, voiceNote);
 });
 
 command(['texto', 'ttp', 'txt'], async (message, raw) => {
@@ -446,6 +613,24 @@ client.on('disconnected', (reason) => {
 // ---------------------------------------------------------------------------
 
 const MAX_TRIES = Math.max(4, config.waWebVersions.length + 1);
+
+// As versões fixadas do WhatsApp Web servem para o QR Code aparecer, mas são anteriores à
+// figurinha com som. Com a sessão já salva (QR já escaneado), a versão mais recente funciona,
+// então ela vem primeiro. Ver https://github.com/wwebjs/whatsapp-web.js/issues/201988
+function hasSavedSession() {
+    try {
+        const dir = path.join(config.dataDir, 'sessao', 'session');
+        return fs.existsSync(dir) && fs.readdirSync(dir).length > 0;
+    } catch (_) {
+        return false;
+    }
+}
+
+function webVersionOrder() {
+    const list = config.waWebVersions;
+    if (process.env.WA_WEB_VERSION || !hasSavedSession() || list[0] === 'latest') return list;
+    return ['latest', ...list.filter((v) => v !== 'latest')];
+}
 let starting = false;
 
 async function start(attempt = 1) {
@@ -454,7 +639,7 @@ async function start(attempt = 1) {
     console.log(attempt === 1
         ? `Abrindo o WhatsApp Web... (sessão em ${config.dataDir})`
         : `Tentativa ${attempt} de ${MAX_TRIES}...`);
-    const versions = config.waWebVersions;
+    const versions = webVersionOrder();
     const version = applyWebVersion(versions[Math.min(attempt - 1, versions.length - 1)]);
     console.log(`Navegador: ${chromePath || 'Chromium do puppeteer'} | WhatsApp Web: ${version}`);
     startWatchdog();

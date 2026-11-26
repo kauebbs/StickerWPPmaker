@@ -37,7 +37,8 @@ const DURATION_RE = /^(\d+(?:\.\d+)?)s$/i;
 
 // Lê as opções do começo do texto; o resto vira legenda/frase.
 // ex.: "redondo amarelo 3-8 bom dia" -> { mode: 'redondo', color, start: 3, duration: 5, text: 'bom dia' }
-function parseOptions(raw, { modes = false, time = false, colors = true, effects = false, file = false } = {}) {
+// "flags" mapeia palavras para opções liga/desliga, ex.: { mp4: 'mp4', video: 'mp4' }
+function parseOptions(raw, { modes = false, time = false, colors = true, effects = false, file = false, flags = {} } = {}) {
     const tokens = raw.split(/\s+/).filter(Boolean);
     const opts = {};
     let i = 0;
@@ -51,6 +52,7 @@ function parseOptions(raw, { modes = false, time = false, colors = true, effects
         else if (colors && !opts.color && COLORS[n]) opts.color = COLORS[n];
         else if (effects && !opts.effect && EFFECT_ALIASES[n]) opts.effect = EFFECT_ALIASES[n];
         else if (file && !opts.file && ['arquivo', 'documento', 'baixar'].includes(n)) opts.file = true;
+        else if (flags[n] && !opts[flags[n]]) opts[flags[n]] = true;
         else if (range && opts.start === undefined) {
             const a = parseTime(range[1]);
             const b = parseTime(range[2]);

@@ -26,6 +26,16 @@ module.exports = {
     // Figurinhas estáticas (WhatsApp recomenda até 100 KB)
     staticMaxKB: Number(process.env.STATIC_MAX_KB || 100),
 
+    // Figurinha com som (!figsom). Regras do WhatsApp: animada até 5s de som, parada até 10s
+    sound: {
+        maxDuration: Number(process.env.SOUND_MAX_DURATION || 10),
+        animatedMaxDuration: Number(process.env.SOUND_ANIMATED_MAX_DURATION || 5),
+        videoDuration: Number(process.env.SOUND_VIDEO_DURATION || 5),
+        // Opção experimental "longo": passa dos limites do WhatsApp (pode não tocar)
+        longAnimatedMaxDuration: Number(process.env.SOUND_LONG_ANIMATED_MAX_DURATION || 10),
+        longMaxDuration: Number(process.env.SOUND_LONG_MAX_DURATION || 20),
+    },
+
     // GIFs gerados (!paragif)
     gif: {
         maxDuration: Number(process.env.GIF_MAX_DURATION || 15),
